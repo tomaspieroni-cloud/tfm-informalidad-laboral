@@ -1,0 +1,4246 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="true">
+  <code><![CDATA[; ============================================================
+; 17_ABM_base_con_shocks.nls
+; NetLogo 7.0.3
+; ============================================================
+; Microsimulacion dinamica estocastica implementada con agentes.
+; Un tick representa un trimestre.
+;
+; Universo inicial:
+; - 41.398 agentes muestrales;
+; - 25.325.272 personas representadas mediante PONDERA;
+; - poblacion de 10 anos o mas del universo laboral clasificable;
+; - periodo inicial 2023T4.
+;
+; Escenarios:
+; - base: probabilidades empiricas sin perturbacion;
+; - contractivo: reduce relativamente la probabilidad formal y
+;   aumenta relativamente la probabilidad de desocupacion.
+; - institucional: modifica las probabilidades de transicion
+;   segun facilidades de contratacion y desvinculacion.
+; - inflacion: afecta la permanencia informal y la formalizacion
+;   de los agentes informales, con exposicion diferenciada por cuartil.
+; - devaluacion: afecta a informales (menor formalizacion, mayor
+;   desocupacion) y a formales (mayor salida a informalidad/desocupacion).
+; - combinado: integra inflacion, devaluacion e institucional en un
+;   solo operador normalizado, evitando sobrescrituras.
+;
+; Ventana predeterminada del shock:
+; - ticks >= 1 y ticks < 4;
+; - transiciones afectadas: 1->2, 2->3 y 3->4.
+;
+; Escenario institucional:
+; - activo desde tick 1 hasta el final;
+; - afecta la transicion 1->2 en adelante.
+;
+; Escenario inflacionario:
+; - activo desde tick 1 hasta tick 3 (transiciones 1->2, 2->3, 3->4);
+; - solo afecta a agentes informales;
+; - reduce formalizacion y aumenta permanencia informal;
+; - exposicion por cuartil: Q1=0.75, Q2=0.90, Q3=1.10, Q4=1.25.
+;
+; Escenario devaluatorio:
+; - activo desde tick 1 hasta tick 3;
+; - afecta a informales (menor formalizacion, mayor desocupacion)
+;   y a formales (mayor salida a informalidad/desocupacion);
+; - exposicion por cuartil para informales (Q1=0.75, Q2=0.90, Q3=1.10, Q4=1.25).
+;
+; Escenario combinado:
+; - activo desde tick 1 hasta tick 3;
+; - integra los tres mecanismos en un solo operador normalizado;
+; - evita la aplicacion secuencial que podria sobrescribir efectos.
+; ============================================================
+
+extensions [csv]
+
+globals [
+  periodo-inicial
+  semilla-modelo
+  tolerancia-probabilidades
+
+  tabla-transiciones-informales
+  tabla-transiciones-otros-estados
+  tabla-perfiles-entrada-general
+  tabla-perfiles-entrada-por-origen
+  tabla-poblacion-inicial
+
+  numero-agentes-inicial
+  peso-total-inicial
+
+  n-formales
+  n-informales
+  n-desocupados
+  n-inactivos
+  informales-sin-cluster
+  informales-sin-cuartil
+
+  n-informales-regla-especifica
+  n-informales-respaldo-cuartil
+  n-informales-regla-general
+
+  peso-formales
+  peso-informales
+  peso-desocupados
+  peso-inactivos
+
+  proporcion-formales
+  proporcion-informales
+  proporcion-desocupados
+  proporcion-inactivos
+
+  escenario
+  shock-activo?
+  intensidad-shock
+  tick-inicio-shock
+  tick-fin-shock
+
+  ; Escenario institucional
+  facilidad-contratacion
+  facilidad-desvinculacion
+  institucional-activo?
+
+  ; Escenario inflacionario
+  intensidad-inflacion
+  inflacion-activa?
+  tick-inicio-inflacion
+  tick-fin-inflacion
+
+  ; Escenario devaluatorio
+  intensidad-devaluacion
+  devaluacion-activa?
+  tick-inicio-devaluacion
+  tick-fin-devaluacion
+]
+
+turtles-own [
+  id-agente
+  id-persona
+  peso
+
+  estado-actual
+  estado-origen
+  estado-siguiente
+
+  cluster-actual
+  cuartil-actual
+  ivlr-observado
+  cluster-siguiente
+  cuartil-siguiente
+
+  ultimo-cluster-informal
+  ultimo-cuartil-informal
+
+  prob-formal
+  prob-informal
+  prob-desocupacion
+  prob-inactividad
+  fuente-probabilidad
+
+  prob-formal-base
+  prob-informal-base
+  prob-desocupacion-base
+  prob-inactividad-base
+
+  nuevo-informal?
+]
+
+; ============================================================
+; SETUP BASE
+; ============================================================
+
+to setup
+
+  inicializar-modelo
+    42
+    "base"
+    0
+    1
+    4
+    0
+    0
+
+end
+
+
+; ============================================================
+; SETUP BASE CON SEMILLA
+; ============================================================
+
+to setup-con-semilla [nueva-semilla]
+
+  validar-semilla nueva-semilla
+
+  inicializar-modelo
+    nueva-semilla
+    "base"
+    0
+    1
+    4
+    0
+    0
+
+end
+
+
+; ============================================================
+; SETUP DEL SHOCK CONTRACTIVO ESTILIZADO
+; ============================================================
+
+to setup-shock [
+  nueva-semilla
+  nueva-intensidad
+]
+
+  validar-semilla nueva-semilla
+  validar-intensidad-shock nueva-intensidad
+
+  inicializar-modelo
+    nueva-semilla
+    "contractivo"
+    nueva-intensidad
+    1
+    4
+    0
+    0
+
+end
+
+
+; ============================================================
+; SETUP INSTITUCIONAL
+; ============================================================
+;
+; Ejemplos:
+;
+; Contratación formal más fácil:
+; setup-institucional 42 0.15 0
+;
+; Contratación y desvinculación más fáciles:
+; setup-institucional 42 0.15 0.15
+;
+; Flexibilización intensa:
+; setup-institucional 42 0.30 0.30
+; ============================================================
+
+to setup-institucional [
+  nueva-semilla
+  nueva-facilidad-contratacion
+  nueva-facilidad-desvinculacion
+]
+
+  validar-semilla nueva-semilla
+
+  validar-parametro-institucional
+    nueva-facilidad-contratacion
+    "facilidad de contratación"
+
+  validar-parametro-institucional
+    nueva-facilidad-desvinculacion
+    "facilidad de desvinculación"
+
+  inicializar-modelo
+    nueva-semilla
+    "institucional"
+    0
+    1
+    4
+    nueva-facilidad-contratacion
+    nueva-facilidad-desvinculacion
+
+end
+
+
+; ============================================================
+; SETUP DEL ESCENARIO INFLACIONARIO
+; ============================================================
+;
+; Ejemplos:
+;
+; Inflacion baja:
+; setup-inflacion 42 0.158
+;
+; Inflacion moderada:
+; setup-inflacion 42 0.325
+;
+; Inflacion alta:
+; setup-inflacion 42 0.421
+; ============================================================
+
+to setup-inflacion [
+  nueva-semilla
+  nueva-intensidad-inflacion
+]
+
+  validar-semilla nueva-semilla
+  validar-intensidad-shock nueva-intensidad-inflacion
+
+  inicializar-modelo
+    nueva-semilla
+    "inflacion"
+    0
+    1
+    4
+    0
+    0
+
+  ; Se asigna despues de inicializar porque
+  ; inicializar-modelo ejecuta clear-all.
+
+  set intensidad-inflacion
+    nueva-intensidad-inflacion
+
+  set tick-inicio-inflacion 1
+  set tick-fin-inflacion 4
+  set inflacion-activa? false
+
+  print (
+    word
+    "Intensidad inflacionaria normalizada: "
+    intensidad-inflacion
+  )
+
+end
+
+
+; ============================================================
+; SETUP DEVALUATORIO
+; ============================================================
+
+to setup-devaluacion [
+  nueva-semilla
+  nueva-intensidad
+]
+
+  validar-semilla nueva-semilla
+  validar-intensidad-shock nueva-intensidad
+
+  inicializar-modelo
+    nueva-semilla
+    "devaluacion"
+    0
+    1
+    4
+    0
+    0
+
+  set intensidad-devaluacion nueva-intensidad
+  set tick-inicio-devaluacion 1
+  set tick-fin-devaluacion 4
+  set devaluacion-activa? false
+
+  print (
+    word
+    "Intensidad devaluatoria: "
+    intensidad-devaluacion
+  )
+
+end
+
+
+; ============================================================
+; SETUP COMBINADO MODERADO
+; ============================================================
+;
+; Inflacion moderada:      0.325
+; Devaluacion moderada:    0.112
+; Contratacion moderada:   0.15
+; Desvinculacion moderada: 0.15
+;
+; El escenario es exploratorio.
+; No representa causalmente un periodo historico concreto.
+; ============================================================
+
+to setup-combinado-moderado [
+  nueva-semilla
+]
+
+  validar-semilla nueva-semilla
+
+  inicializar-modelo
+    nueva-semilla
+    "combinado"
+    0
+    1
+    4
+    0.15
+    0.15
+
+  set intensidad-inflacion 0.325
+  set intensidad-devaluacion 0.112
+
+  set tick-inicio-inflacion 1
+  set tick-fin-inflacion 4
+
+  set tick-inicio-devaluacion 1
+  set tick-fin-devaluacion 4
+
+  set inflacion-activa? false
+  set devaluacion-activa? false
+  set institucional-activo? false
+
+  print "ESCENARIO COMBINADO MODERADO"
+  print (
+    word
+    "Inflacion: "
+    intensidad-inflacion
+  )
+  print (
+    word
+    "Devaluacion: "
+    intensidad-devaluacion
+  )
+  print (
+    word
+    "Contratacion: "
+    facilidad-contratacion
+  )
+  print (
+    word
+    "Desvinculacion: "
+    facilidad-desvinculacion
+  )
+
+end
+
+
+; ============================================================
+; SETUP GENERAL DE ESCENARIOS
+; ============================================================
+
+to setup-escenario [
+  nueva-semilla
+  nuevo-escenario
+  nueva-intensidad
+  inicio
+  fin
+  nueva-facilidad-contratacion
+  nueva-facilidad-desvinculacion
+]
+
+  validar-semilla nueva-semilla
+  validar-intensidad-shock nueva-intensidad
+
+  validar-parametro-institucional
+    nueva-facilidad-contratacion
+    "facilidad de contratación"
+
+  validar-parametro-institucional
+    nueva-facilidad-desvinculacion
+    "facilidad de desvinculación"
+
+  inicializar-modelo
+    nueva-semilla
+    nuevo-escenario
+    nueva-intensidad
+    inicio
+    fin
+    nueva-facilidad-contratacion
+    nueva-facilidad-desvinculacion
+
+end
+
+
+; ============================================================
+; VALIDAR PARÁMETRO INSTITUCIONAL
+; ============================================================
+
+to validar-parametro-institucional [
+  valor
+  nombre-parametro
+]
+
+  if not is-number? valor [
+    error (
+      word
+      "El parámetro "
+      nombre-parametro
+      " debe ser numérico."
+    )
+  ]
+
+  if valor < 0 or valor > 1 [
+    error (
+      word
+      "El parámetro "
+      nombre-parametro
+      " debe pertenecer a [0,1]."
+    )
+  ]
+
+end
+
+; ============================================================
+; SETUP DESDE LA INTERFAZ
+; ============================================================
+;
+; Este procedimiento conecta los controles visuales del tablero
+; con los setups ya validados.
+;
+; No modifica el motor ni las reglas de transición.
+; ============================================================
+
+to setup-desde-interfaz
+
+  if escenario-interfaz = "Base" [
+    setup-con-semilla semilla-interfaz
+    stop
+  ]
+
+  if escenario-interfaz = "Institucional: contratacion" [
+    setup-institucional semilla-interfaz 0.15 0
+    stop
+  ]
+
+  if escenario-interfaz = "Institucional: flexibilidad moderada" [
+    setup-institucional semilla-interfaz 0.15 0.15
+    stop
+  ]
+
+  if escenario-interfaz = "Institucional: flexibilidad intensa" [
+    setup-institucional semilla-interfaz 0.30 0.30
+    stop
+  ]
+
+  if escenario-interfaz = "Inflacion baja" [
+    setup-inflacion semilla-interfaz 0.158
+    stop
+  ]
+
+  if escenario-interfaz = "Inflacion moderada" [
+    setup-inflacion semilla-interfaz 0.325
+    stop
+  ]
+
+  if escenario-interfaz = "Inflacion alta" [
+    setup-inflacion semilla-interfaz 0.421
+    stop
+  ]
+
+  if escenario-interfaz = "Devaluacion baja" [
+    setup-devaluacion semilla-interfaz 0.057
+    stop
+  ]
+
+  if escenario-interfaz = "Devaluacion moderada" [
+    setup-devaluacion semilla-interfaz 0.112
+    stop
+  ]
+
+  if escenario-interfaz = "Devaluacion alta" [
+    setup-devaluacion semilla-interfaz 0.186
+    stop
+  ]
+
+  if escenario-interfaz = "Combinado moderado" [
+    setup-combinado-moderado semilla-interfaz
+    stop
+  ]
+
+  setup-con-semilla semilla-interfaz
+
+end
+
+; ============================================================
+; INICIALIZACION
+; ============================================================
+
+to validar-semilla [valor]
+  if not is-number? valor [ error "La semilla debe ser numerica." ]
+  if valor < 0 [ error "La semilla no puede ser negativa." ]
+  if valor != floor valor [ error "La semilla debe ser entera." ]
+end
+
+to validar-intensidad-shock [valor]
+  if not is-number? valor [ error "La intensidad debe ser numerica." ]
+  if valor < 0 or valor > 1 [ error "La intensidad debe pertenecer a [0,1]." ]
+end
+
+to inicializar-modelo [
+  semilla-elegida
+  escenario-elegido
+  intensidad-elegida
+  inicio-elegido
+  fin-elegido
+  contratacion-elegida
+  desvinculacion-elegida
+]
+  clear-all
+  file-close-all
+
+  set periodo-inicial "2023T4"
+  set semilla-modelo semilla-elegida
+  set tolerancia-probabilidades 1.0e-8
+
+  set escenario escenario-elegido
+  set intensidad-shock intensidad-elegida
+  set tick-inicio-shock inicio-elegido
+  set tick-fin-shock fin-elegido
+  set shock-activo? false
+
+  validar-semilla semilla-modelo
+  validar-intensidad-shock intensidad-shock
+
+  set facilidad-contratacion
+    contratacion-elegida
+
+  set facilidad-desvinculacion
+    desvinculacion-elegida
+
+  set institucional-activo? false
+
+  set intensidad-inflacion 0
+  set inflacion-activa? false
+  set tick-inicio-inflacion 1
+  set tick-fin-inflacion 4
+
+  set intensidad-devaluacion 0
+  set devaluacion-activa? false
+  set tick-inicio-devaluacion 1
+  set tick-fin-devaluacion 4
+
+  if not member? escenario [
+    "base"
+    "contractivo"
+    "institucional"
+    "inflacion"
+    "devaluacion"
+    "combinado"
+  ] [
+    error (word "Escenario no reconocido: " escenario)
+  ]
+
+  validar-parametro-institucional
+    facilidad-contratacion
+    "facilidad de contratación"
+
+  validar-parametro-institucional
+    facilidad-desvinculacion
+    "facilidad de desvinculación"
+
+  if escenario = "base" and intensidad-shock != 0 [
+    error "El escenario base debe tener intensidad cero."
+  ]
+
+  if escenario = "base"
+    and (
+      facilidad-contratacion != 0
+      or facilidad-desvinculacion != 0
+    ) [
+    error "El escenario base no puede tener ajustes institucionales."
+  ]
+
+  if escenario = "contractivo"
+    and (
+      facilidad-contratacion != 0
+      or facilidad-desvinculacion != 0
+    ) [
+    error "El escenario contractivo no debe mezclar ajustes institucionales."
+  ]
+
+  if escenario = "institucional"
+    and intensidad-shock != 0 [
+    error "El escenario institucional no debe tener shock contractivo."
+  ]
+
+  if escenario = "inflacion"
+    and intensidad-shock != 0 [
+    error "El escenario inflacionario no debe tener shock contractivo."
+  ]
+
+  if escenario = "inflacion"
+    and (
+      facilidad-contratacion != 0
+      or facilidad-desvinculacion != 0
+    ) [
+    error "El escenario inflacionario no debe tener ajustes institucionales."
+  ]
+
+  if escenario = "devaluacion"
+    and intensidad-shock != 0 [
+    error "El escenario devaluatorio no debe tener shock contractivo."
+  ]
+
+  if escenario = "devaluacion"
+    and (
+      facilidad-contratacion != 0
+      or facilidad-desvinculacion != 0
+    ) [
+    error "El escenario devaluatorio no debe tener ajustes institucionales."
+  ]
+
+  if escenario = "combinado" and intensidad-shock != 0 [
+    error "El escenario combinado no debe tener shock contractivo."
+  ]
+
+  if tick-fin-shock <= tick-inicio-shock [
+    error "El fin del shock debe ser posterior al inicio."
+  ]
+
+  random-seed semilla-modelo
+
+  cargar-insumos
+  cargar-poblacion-inicial
+  crear-agentes-iniciales
+  validar-agentes-iniciales
+  validar-reglas-aplicables-informales
+
+  reset-ticks
+  registrar-indicadores
+  validar-indicadores
+
+  print "============================================"
+  print "SETUP COMPLETADO"
+  print (word "Periodo inicial: " periodo-inicial)
+  print (word "Semilla: " semilla-modelo)
+  print (word "Escenario: " escenario)
+  print (word "Intensidad: " intensidad-shock)
+  print (word "Ventana: ticks " tick-inicio-shock " a " tick-fin-shock " (fin excluido)")
+  print (word "Facilidad de contratación: " facilidad-contratacion)
+  print (word "Facilidad de desvinculación: " facilidad-desvinculacion)
+  print (word "Agentes: " count turtles)
+  print (word "Peso total: " peso-total-inicial)
+  print (word "Tick: " ticks)
+  print "============================================"
+end
+
+to go
+  preparar-probabilidades
+  sortear-destinos-provisionales
+  sortear-perfiles-nuevos-informales
+  actualizar-estados-simultaneamente
+end
+
+; ============================================================
+; CARGA Y VALIDACION DE INSUMOS
+; ============================================================
+
+to cargar-insumos
+  cargar-transiciones-informales
+  cargar-transiciones-otros-estados
+  cargar-perfiles-entrada-general
+  cargar-perfiles-entrada-por-origen
+end
+
+to cargar-transiciones-informales
+  let ruta "../Salidas/13_abm_base/insumos_netlogo/transiciones_informales.csv"
+  if not file-exists? ruta [ error (word "No se encontro: " ruta) ]
+  set tabla-transiciones-informales csv:from-file ruta
+  if empty? tabla-transiciones-informales [ error "La tabla informal esta vacia." ]
+
+  let encabezado replace-item 0 (first tabla-transiciones-informales) "cluster"
+  let esperado ["cluster" "cuartil" "p_formal" "p_informal" "p_desocupacion" "p_inactividad" "fuente"]
+  if encabezado != esperado [ error (word "Encabezado informal incorrecto: " encabezado) ]
+
+  let datos but-first tabla-transiciones-informales
+  if length datos != 25 [ error (word "Se esperaban 25 reglas informales y hay " length datos) ]
+  foreach datos [ fila ->
+    if length fila != 7 [ error (word "Fila informal incorrecta: " fila) ]
+    validar-vector-probabilidades (list (item 2 fila) (item 3 fila) (item 4 fila) (item 5 fila)) "transiciones informales"
+  ]
+  validar-claves-exactas-informales
+  print "Transiciones informales: 25 reglas validadas."
+end
+
+to validar-claves-exactas-informales
+  let datos but-first tabla-transiciones-informales
+  let esperadas []
+  foreach [1 2 3 4 5] [ c ->
+    foreach [1 2 3 4] [ q -> set esperadas lput (word c "_" q) esperadas ]
+  ]
+  foreach [1 2 3 4] [ q -> set esperadas lput (word "sin_cluster_" q) esperadas ]
+  set esperadas lput "general_0" esperadas
+
+  let observadas map [ fila -> (word (item 0 fila) "_" (item 1 fila)) ] datos
+  if length remove-duplicates observadas != 25 [ error "Existen claves informales duplicadas." ]
+  let faltantes filter [ clave -> not member? clave observadas ] esperadas
+  let inesperadas filter [ clave -> not member? clave esperadas ] observadas
+  if not empty? faltantes [ error (word "Faltan reglas informales: " faltantes) ]
+  if not empty? inesperadas [ error (word "Hay reglas informales inesperadas: " inesperadas) ]
+
+  foreach datos [ fila ->
+    let c item 0 fila
+    let q item 1 fila
+    let f item 6 fila
+    if member? c [1 2 3 4 5] and f != "cluster_cuartil" [ error (word "Fuente incorrecta para " c "_" q) ]
+    if c = "sin_cluster" and f != "cuartil_general" [ error (word "Fuente incorrecta para sin_cluster_" q) ]
+    if c = "general" and (q != 0 or f != "general") [ error "La regla general informal es incorrecta." ]
+  ]
+end
+
+to cargar-transiciones-otros-estados
+  let ruta "../Salidas/13_abm_base/insumos_netlogo/transiciones_otros_estados.csv"
+  if not file-exists? ruta [ error (word "No se encontro: " ruta) ]
+  set tabla-transiciones-otros-estados csv:from-file ruta
+  if empty? tabla-transiciones-otros-estados [ error "La tabla de otros estados esta vacia." ]
+
+  let encabezado replace-item 0 (first tabla-transiciones-otros-estados) "origen"
+  let esperado ["origen" "p_formal" "p_informal" "p_desocupacion" "p_inactividad" "fuente"]
+  if encabezado != esperado [ error (word "Encabezado de otros estados incorrecto: " encabezado) ]
+
+  let datos but-first tabla-transiciones-otros-estados
+  if length datos != 3 [ error (word "Se esperaban 3 reglas y hay " length datos) ]
+  let origenes map [ fila -> item 0 fila ] datos
+  if length remove-duplicates origenes != 3 [ error "Existen origenes duplicados." ]
+  foreach ["formal" "desocupacion" "inactividad"] [ o ->
+    if not member? o origenes [ error (word "Falta el origen: " o) ]
+  ]
+  foreach datos [ fila ->
+    if length fila != 6 [ error (word "Fila de otros estados incorrecta: " fila) ]
+    validar-vector-probabilidades (list (item 1 fila) (item 2 fila) (item 3 fila) (item 4 fila)) (word "origen " item 0 fila)
+  ]
+  print "Transiciones de otros estados: 3 reglas validadas."
+end
+
+to cargar-perfiles-entrada-general
+  let ruta "../Salidas/13_abm_base/insumos_netlogo/perfiles_entrada_general.csv"
+  if not file-exists? ruta [ error (word "No se encontro: " ruta) ]
+  set tabla-perfiles-entrada-general csv:from-file ruta
+  if empty? tabla-perfiles-entrada-general [ error "La tabla general de perfiles esta vacia." ]
+
+  let encabezado replace-item 0 (first tabla-perfiles-entrada-general) "cluster"
+  let esperado ["cluster" "cuartil" "probabilidad" "fuente"]
+  if encabezado != esperado [ error (word "Encabezado del perfil general incorrecto: " encabezado) ]
+
+  let datos but-first tabla-perfiles-entrada-general
+  if length datos != 24 [ error (word "Se esperaban 24 perfiles generales y hay " length datos) ]
+  let claves map [ fila -> (word (item 0 fila) "_" (item 1 fila)) ] datos
+  if length remove-duplicates claves != 24 [ error "Existen perfiles generales duplicados." ]
+  foreach datos [ fila ->
+    if length fila != 4 [ error (word "Fila del perfil general incorrecta: " fila) ]
+    validar-probabilidad (item 2 fila) "perfil general"
+  ]
+  let suma sum map [ fila -> item 2 fila ] datos
+  if abs (suma - 1) > tolerancia-probabilidades [ error (word "El perfil general suma " suma) ]
+  print "Perfil general de entrada: 24 combinaciones validadas."
+end
+
+to cargar-perfiles-entrada-por-origen
+  let ruta "../Salidas/13_abm_base/insumos_netlogo/perfiles_entrada_por_origen.csv"
+  if not file-exists? ruta [ error (word "No se encontro: " ruta) ]
+  set tabla-perfiles-entrada-por-origen csv:from-file ruta
+  if empty? tabla-perfiles-entrada-por-origen [ error "La tabla de perfiles por origen esta vacia." ]
+
+  let encabezado replace-item 0 (first tabla-perfiles-entrada-por-origen) "origen"
+  let esperado ["origen" "cluster" "cuartil" "probabilidad" "fuente"]
+  if encabezado != esperado [ error (word "Encabezado de perfiles por origen incorrecto: " encabezado) ]
+
+  let datos but-first tabla-perfiles-entrada-por-origen
+  if length datos != 70 [ error (word "Se esperaban 70 perfiles por origen y hay " length datos) ]
+  let claves map [ fila -> (word (item 0 fila) "_" (item 1 fila) "_" (item 2 fila)) ] datos
+  if length remove-duplicates claves != 70 [ error "Existen perfiles por origen duplicados." ]
+  foreach datos [ fila ->
+    if length fila != 5 [ error (word "Fila de perfil por origen incorrecta: " fila) ]
+    validar-probabilidad (item 3 fila) "perfil por origen"
+  ]
+  foreach ["formal" "desocupacion" "inactividad"] [ o ->
+    let filas filter [ fila -> item 0 fila = o ] datos
+    if empty? filas [ error (word "No hay perfiles para el origen " o) ]
+    let suma sum map [ fila -> item 3 fila ] filas
+    if abs (suma - 1) > tolerancia-probabilidades [ error (word "Los perfiles de " o " suman " suma) ]
+  ]
+  print "Perfiles por origen: 70 combinaciones validadas."
+end
+
+to validar-vector-probabilidades [vector contexto]
+  if length vector != 4 [ error (word "Vector incompleto en " contexto) ]
+  foreach vector [ valor -> validar-probabilidad valor contexto ]
+  let suma sum vector
+  if abs (suma - 1) > tolerancia-probabilidades [ error (word "Las probabilidades de " contexto " suman " suma) ]
+end
+
+to validar-probabilidad [valor contexto]
+  if not is-number? valor [ error (word "Probabilidad no numerica en " contexto) ]
+  if valor < 0 or valor > 1 [ error (word "Probabilidad fuera de [0,1] en " contexto) ]
+end
+
+; ============================================================
+; POBLACION INICIAL
+; ============================================================
+
+to cargar-poblacion-inicial
+  let ruta "../Salidas/13_abm_base/poblacion_inicial_2023T4.csv"
+  if not file-exists? ruta [ error (word "No se encontro: " ruta) ]
+  set tabla-poblacion-inicial csv:from-file ruta
+  if empty? tabla-poblacion-inicial [ error "La poblacion inicial esta vacia." ]
+
+  let encabezado replace-item 0 (first tabla-poblacion-inicial) "id_agente"
+  let esperado ["id_agente" "id_persona" "ano" "trimestre" "peso" "estado_actual" "cluster_actual" "cuartil_actual" "ivlr_observado" "ultimo_cluster_informal" "ultimo_cuartil_informal"]
+  if encabezado != esperado [ error (word "Encabezado de poblacion incorrecto: " encabezado) ]
+
+  let datos but-first tabla-poblacion-inicial
+  if length datos != 41398 [ error (word "Se esperaban 41398 personas y hay " length datos) ]
+  foreach datos [ fila ->
+    if length fila != 11 [ error (word "Fila de poblacion incorrecta: " fila) ]
+    if item 2 fila != 2023 or item 3 fila != 4 [ error "La poblacion contiene un periodo distinto de 2023T4." ]
+    if not member? (item 5 fila) ["formal" "informal" "desocupacion" "inactividad"] [
+      error (word "Estado inicial invalido: " item 5 fila)
+    ]
+  ]
+  let ids map [ fila -> item 0 fila ] datos
+  if length remove-duplicates ids != 41398 [ error "Existen id_agente duplicados." ]
+  print "Poblacion inicial: 41398 filas validadas."
+end
+
+to crear-agentes-iniciales
+  let datos but-first tabla-poblacion-inicial
+  foreach datos [ fila ->
+    create-turtles 1 [
+      set id-agente item 0 fila
+      set id-persona item 1 fila
+      set peso item 4 fila
+      set estado-actual item 5 fila
+      set estado-origen ""
+      set estado-siguiente ""
+
+      set cluster-siguiente -1
+      set cuartil-siguiente -1
+      set prob-formal -1
+      set prob-informal -1
+      set prob-desocupacion -1
+      set prob-inactividad -1
+      set prob-formal-base -1
+      set prob-informal-base -1
+      set prob-desocupacion-base -1
+      set prob-inactividad-base -1
+      set fuente-probabilidad ""
+      set nuevo-informal? false
+
+      ifelse estado-actual = "informal" [
+        set cluster-actual convertir-cluster-inicial (item 6 fila)
+        set cuartil-actual convertir-cuartil-inicial (item 7 fila)
+        set ivlr-observado convertir-ivlr-inicial (item 8 fila)
+        set ultimo-cluster-informal cluster-actual
+        set ultimo-cuartil-informal cuartil-actual
+      ] [
+        set cluster-actual -1
+        set cuartil-actual -1
+        set ivlr-observado -1
+        set ultimo-cluster-informal -1
+        set ultimo-cuartil-informal -1
+      ]
+      hide-turtle
+    ]
+  ]
+  set numero-agentes-inicial count turtles
+  set peso-total-inicial sum [peso] of turtles
+end
+
+to-report convertir-cluster-inicial [valor]
+  if valor = "NA" or valor = "" [ report -9 ]
+  if is-number? valor [ report valor ]
+  report read-from-string valor
+end
+
+to-report convertir-cuartil-inicial [valor]
+  if valor = "NA" or valor = "" [ report -9 ]
+  if is-number? valor [ report valor ]
+  if valor = "Q1 menor vulnerabilidad" [ report 1 ]
+  if valor = "Q2" [ report 2 ]
+  if valor = "Q3" [ report 3 ]
+  if valor = "Q4 mayor vulnerabilidad" [ report 4 ]
+  error (word "Cuartil no reconocido: " valor)
+end
+
+to-report convertir-ivlr-inicial [valor]
+  if valor = "NA" or valor = "" [ report -9 ]
+  if is-number? valor [ report valor ]
+  report read-from-string valor
+end
+
+to validar-agentes-iniciales
+  if count turtles != 41398 [ error (word "Se crearon " count turtles " agentes.") ]
+  if length remove-duplicates [id-agente] of turtles != count turtles [ error "Existen id-agente duplicados." ]
+  if length remove-duplicates [id-persona] of turtles != count turtles [ error "Existen id-persona duplicados." ]
+  if any? turtles with [peso <= 0] [ error "Existen pesos no positivos." ]
+  if any? turtles with [not member? estado-actual ["formal" "informal" "desocupacion" "inactividad"]] [ error "Existen estados invalidos." ]
+  if any? turtles with [estado-actual = "informal" and not member? cluster-actual [-9 1 2 3 4 5]] [ error "Existen clusters invalidos." ]
+  if any? turtles with [estado-actual = "informal" and not member? cuartil-actual [-9 1 2 3 4]] [ error "Existen cuartiles invalidos." ]
+  if any? turtles with [estado-actual != "informal" and (cluster-actual != -1 or cuartil-actual != -1 or ivlr-observado != -1)] [
+    error "Un no informal tiene atributos informales activos."
+  ]
+
+  registrar-indicadores
+  set informales-sin-cluster count turtles with [estado-actual = "informal" and cluster-actual = -9]
+  set informales-sin-cuartil count turtles with [estado-actual = "informal" and cuartil-actual = -9]
+
+  if n-formales != 12151 [ error "Conteo formal incorrecto." ]
+  if n-informales != 9114 [ error "Conteo informal incorrecto." ]
+  if n-desocupados != 1055 [ error "Conteo desocupado incorrecto." ]
+  if n-inactivos != 19078 [ error "Conteo inactivo incorrecto." ]
+  if informales-sin-cluster != 55 [ error "Conteo sin cluster incorrecto." ]
+  if informales-sin-cuartil != 1399 [ error "Conteo sin cuartil incorrecto." ]
+  print "Agentes iniciales: poblacion reproducida correctamente."
+end
+
+to-report clave-informal
+  if cuartil-actual = -9 [ report "general_0" ]
+  if cluster-actual = -9 [ report (word "sin_cluster_" cuartil-actual) ]
+  if member? cluster-actual [1 2 3 4 5] [ report (word cluster-actual "_" cuartil-actual) ]
+  error (word "Perfil informal invalido. Cluster=" cluster-actual ", cuartil=" cuartil-actual)
+end
+
+to validar-reglas-aplicables-informales
+  let datos but-first tabla-transiciones-informales
+  let claves map [ fila -> (word (item 0 fila) "_" (item 1 fila)) ] datos
+  set n-informales-regla-especifica 0
+  set n-informales-respaldo-cuartil 0
+  set n-informales-regla-general 0
+
+  ask turtles with [estado-actual = "informal"] [
+    let clave clave-informal
+    if not member? clave claves [ error (word "No existe la regla " clave " para el agente " id-agente) ]
+    ifelse cuartil-actual = -9 [
+      set n-informales-regla-general n-informales-regla-general + 1
+    ] [
+      ifelse cluster-actual = -9 [
+        set n-informales-respaldo-cuartil n-informales-respaldo-cuartil + 1
+      ] [
+        set n-informales-regla-especifica n-informales-regla-especifica + 1
+      ]
+    ]
+  ]
+  let total n-informales-regla-especifica + n-informales-respaldo-cuartil + n-informales-regla-general
+  if total != n-informales [ error (word "Solo se clasificaron " total " informales.") ]
+  print (word "Rutas informales: " n-informales-regla-especifica " especificas, " n-informales-respaldo-cuartil " por cuartil y " n-informales-regla-general " generales.")
+end
+
+; ============================================================
+; INDICADORES
+; ============================================================
+
+to registrar-indicadores
+  set n-formales count turtles with [estado-actual = "formal"]
+  set n-informales count turtles with [estado-actual = "informal"]
+  set n-desocupados count turtles with [estado-actual = "desocupacion"]
+  set n-inactivos count turtles with [estado-actual = "inactividad"]
+
+  set peso-formales sum [peso] of turtles with [estado-actual = "formal"]
+  set peso-informales sum [peso] of turtles with [estado-actual = "informal"]
+  set peso-desocupados sum [peso] of turtles with [estado-actual = "desocupacion"]
+  set peso-inactivos sum [peso] of turtles with [estado-actual = "inactividad"]
+
+  if peso-total-inicial > 0 [
+    set proporcion-formales peso-formales / peso-total-inicial
+    set proporcion-informales peso-informales / peso-total-inicial
+    set proporcion-desocupados peso-desocupados / peso-total-inicial
+    set proporcion-inactivos peso-inactivos / peso-total-inicial
+  ]
+end
+
+to validar-indicadores
+  let suma-pesos peso-formales + peso-informales + peso-desocupados + peso-inactivos
+  let suma-proporciones proporcion-formales + proporcion-informales + proporcion-desocupados + proporcion-inactivos
+  if abs (suma-pesos - peso-total-inicial) > 1.0e-6 [ error "Los pesos por estado no suman el peso total." ]
+  if abs (suma-proporciones - 1) > tolerancia-probabilidades [ error "Las proporciones no suman uno." ]
+end
+
+; ============================================================
+; DETERMINAR ACTIVACIÓN INSTITUCIONAL
+; ============================================================
+;
+; El escenario institucional comienza cuando ticks = 1.
+; Por tanto, la primera transición afectada es 1 -> 2.
+; Permanece activo hasta finalizar la simulación.
+; ============================================================
+to actualizar-estado-institucional
+
+  set institucional-activo? false
+
+  ; Escenario institucional independiente:
+  ; permanece activo desde la transicion 1 -> 2
+  ; hasta el final de la simulacion.
+
+  if escenario = "institucional" [
+
+    set institucional-activo? (
+      ticks >= 1
+      and (
+        facilidad-contratacion > 0
+        or facilidad-desvinculacion > 0
+      )
+    )
+  ]
+
+  ; Escenario combinado:
+  ; el componente institucional opera solamente
+  ; durante las mismas tres transiciones que los
+  ; componentes inflacionario y devaluatorio.
+
+  if escenario = "combinado" [
+
+    set institucional-activo? (
+      ticks >= 1
+      and ticks < 4
+      and (
+        facilidad-contratacion > 0
+        or facilidad-desvinculacion > 0
+      )
+    )
+  ]
+
+end
+
+
+; ============================================================
+; AJUSTAR VECTOR INSTITUCIONAL
+; ============================================================
+;
+; Posiciones del vector:
+; 0 = formal
+; 1 = informal
+; 2 = desocupación
+; 3 = inactividad
+;
+; Contratación:
+; - informal -> formal
+; - desocupación -> formal
+;
+; Desvinculación:
+; - formal -> informal
+; - formal -> desocupación
+; ============================================================
+
+to-report ajustar-vector-institucional [
+  vector
+  estado-origen-individual
+  parametro-contratacion
+  parametro-desvinculacion
+]
+
+  if length vector != 4 [
+    error "El vector institucional debe contener cuatro probabilidades."
+  ]
+
+  if not empty? (
+    filter [
+      valor ->
+      not is-number? valor
+    ] vector
+  ) [
+    error "El vector institucional contiene valores no numéricos."
+  ]
+
+  if not empty? (
+    filter [
+      valor ->
+      valor < 0 or valor > 1
+    ] vector
+  ) [
+    error "El vector institucional contiene valores fuera de [0,1]."
+  ]
+
+  if abs (
+    sum vector - 1
+  ) > tolerancia-probabilidades [
+    error "El vector institucional previo no suma uno."
+  ]
+
+  if not member? estado-origen-individual [
+    "formal"
+    "informal"
+    "desocupacion"
+    "inactividad"
+  ] [
+    error (
+      word
+      "Estado institucional no reconocido: "
+      estado-origen-individual
+    )
+  ]
+
+  if parametro-contratacion < 0
+    or parametro-contratacion > 1 [
+    error "La facilidad de contratación debe pertenecer a [0,1]."
+  ]
+
+  if parametro-desvinculacion < 0
+    or parametro-desvinculacion > 1 [
+    error "La facilidad de desvinculación debe pertenecer a [0,1]."
+  ]
+
+
+  ; Partir del vector empírico original.
+
+  let formal-ajustada
+    item 0 vector
+
+  let informal-ajustada
+    item 1 vector
+
+  let desocupacion-ajustada
+    item 2 vector
+
+  let inactividad-ajustada
+    item 3 vector
+
+
+  ; ----------------------------------------------------------
+  ; Facilidad de contratación formal
+  ; ----------------------------------------------------------
+
+  if member? estado-origen-individual [
+    "informal"
+    "desocupacion"
+  ] [
+
+    set formal-ajustada (
+      formal-ajustada
+      * (1 + parametro-contratacion)
+    )
+  ]
+
+
+  ; ----------------------------------------------------------
+  ; Facilidad de desvinculación
+  ; ----------------------------------------------------------
+
+  if estado-origen-individual = "formal" [
+
+    set informal-ajustada (
+      informal-ajustada
+      * (1 + parametro-desvinculacion)
+    )
+
+    set desocupacion-ajustada (
+      desocupacion-ajustada
+      * (1 + parametro-desvinculacion)
+    )
+  ]
+
+
+  ; ----------------------------------------------------------
+  ; Normalización
+  ; ----------------------------------------------------------
+
+  let suma-ajustada (
+    formal-ajustada
+    + informal-ajustada
+    + desocupacion-ajustada
+    + inactividad-ajustada
+  )
+
+  if suma-ajustada <= 0 [
+    error "El ajuste institucional produjo una suma no positiva."
+  ]
+
+  report (
+    list
+      (formal-ajustada / suma-ajustada)
+      (informal-ajustada / suma-ajustada)
+      (desocupacion-ajustada / suma-ajustada)
+      (inactividad-ajustada / suma-ajustada)
+  )
+
+end
+
+
+; ============================================================
+; APLICAR AJUSTE AL AGENTE ACTUAL
+; ============================================================
+;
+; Este procedimiento se ejecuta dentro de los ask ya existentes.
+; No agrega otro ask y no consume números aleatorios.
+; ============================================================
+
+to aplicar-ajuste-institucional-individual
+
+  if institucional-activo?
+    and escenario != "combinado" [
+
+    let ajustadas
+      ajustar-vector-institucional
+        (list
+          prob-formal-base
+          prob-informal-base
+          prob-desocupacion-base
+          prob-inactividad-base
+        )
+        estado-actual
+        facilidad-contratacion
+        facilidad-desvinculacion
+
+    set prob-formal
+      item 0 ajustadas
+
+    set prob-informal
+      item 1 ajustadas
+
+    set prob-desocupacion
+      item 2 ajustadas
+
+    set prob-inactividad
+      item 3 ajustadas
+  ]
+
+end
+
+
+; ============================================================
+; EXPOSICION INFLACIONARIA POR CUARTIL
+; ============================================================
+
+to-report exposicion-inflacion-cuartil [
+  cuartil
+]
+
+  if cuartil = 1 [ report 0.75 ]
+  if cuartil = 2 [ report 0.90 ]
+  if cuartil = 3 [ report 1.10 ]
+  if cuartil = 4 [ report 1.25 ]
+  if cuartil = -9 [ report 1.00 ]
+
+  error (
+    word
+    "Cuartil invalido para inflacion: "
+    cuartil
+  )
+
+end
+
+
+; ============================================================
+; AJUSTAR VECTOR POR INFLACION
+; ============================================================
+;
+; Solo se utiliza para agentes informales.
+;
+; Reduce:
+; informal -> formal
+;
+; Aumenta:
+; informal -> informal
+;
+; Desocupacion e inactividad no reciben
+; multiplicadores directos.
+; ============================================================
+
+to-report ajustar-vector-inflacion [
+  vector
+  intensidad-general
+  exposicion-cuartil
+]
+
+  if length vector != 4 [
+    error "El vector inflacionario debe contener cuatro probabilidades."
+  ]
+
+  if intensidad-general < 0
+    or intensidad-general > 1 [
+    error "La intensidad inflacionaria debe pertenecer a [0,1]."
+  ]
+
+  if exposicion-cuartil <= 0 [
+    error "La exposicion inflacionaria debe ser positiva."
+  ]
+
+  if not empty? (
+    filter [
+      valor ->
+      not is-number? valor
+    ] vector
+  ) [
+    error "El vector inflacionario contiene valores no numericos."
+  ]
+
+  if not empty? (
+    filter [
+      valor ->
+      valor < 0 or valor > 1
+    ] vector
+  ) [
+    error "El vector inflacionario contiene probabilidades invalidas."
+  ]
+
+  if abs (
+    sum vector - 1
+  ) > tolerancia-probabilidades [
+    error "El vector previo a la inflacion no suma uno."
+  ]
+
+  let intensidad-individual (
+    intensidad-general
+    * exposicion-cuartil
+  )
+
+  ; Evita que 1 - intensidad sea negativo.
+
+  set intensidad-individual
+    min list intensidad-individual 1
+
+  let formal-ajustada (
+    item 0 vector
+    * (1 - intensidad-individual)
+  )
+
+  let informal-ajustada (
+    item 1 vector
+    * (1 + intensidad-individual)
+  )
+
+  let desocupacion-ajustada
+    item 2 vector
+
+  let inactividad-ajustada
+    item 3 vector
+
+  let suma-ajustada (
+    formal-ajustada
+    + informal-ajustada
+    + desocupacion-ajustada
+    + inactividad-ajustada
+  )
+
+  if suma-ajustada <= 0 [
+    error "La inflacion produjo una suma no positiva."
+  ]
+
+  report (
+    list
+      (formal-ajustada / suma-ajustada)
+      (informal-ajustada / suma-ajustada)
+      (desocupacion-ajustada / suma-ajustada)
+      (inactividad-ajustada / suma-ajustada)
+  )
+
+end
+
+
+; ============================================================
+; ACTIVACION DEL ESCENARIO INFLACIONARIO
+; ============================================================
+
+to actualizar-estado-inflacion
+
+  set inflacion-activa? (
+    member? escenario [
+      "inflacion"
+      "combinado"
+    ]
+    and intensidad-inflacion > 0
+    and ticks >= tick-inicio-inflacion
+    and ticks < tick-fin-inflacion
+  )
+
+end
+
+
+; ============================================================
+; APLICAR INFLACION AL AGENTE ACTUAL
+; ============================================================
+;
+; Se ejecuta dentro del ask de agentes informales.
+; No agrega un ask y no consume numeros aleatorios.
+; ============================================================
+
+to aplicar-inflacion-individual
+
+  if inflacion-activa?
+    and escenario != "combinado" [
+
+    if estado-actual != "informal" [
+      error "Se intento aplicar inflacion directa a un agente no informal."
+    ]
+
+    let exposicion
+      exposicion-inflacion-cuartil
+        cuartil-actual
+
+    let ajustadas
+      ajustar-vector-inflacion
+        (list
+          prob-formal-base
+          prob-informal-base
+          prob-desocupacion-base
+          prob-inactividad-base
+        )
+        intensidad-inflacion
+        exposicion
+
+    set prob-formal
+      item 0 ajustadas
+
+    set prob-informal
+      item 1 ajustadas
+
+    set prob-desocupacion
+      item 2 ajustadas
+
+    set prob-inactividad
+      item 3 ajustadas
+  ]
+
+end
+
+
+; ============================================================
+; ACTIVACION DEL ESCENARIO DEVALUATORIO
+; ============================================================
+
+to actualizar-estado-devaluacion
+
+  set devaluacion-activa? (
+    member? escenario [
+      "devaluacion"
+      "combinado"
+    ]
+    and intensidad-devaluacion > 0
+    and ticks >= tick-inicio-devaluacion
+    and ticks < tick-fin-devaluacion
+  )
+
+end
+
+
+; ============================================================
+; AJUSTAR VECTOR POR DEVALUACION
+; ============================================================
+
+to-report ajustar-vector-devaluacion [
+  vector
+  estado-origen-individual
+  intensidad-individual
+]
+
+  if length vector != 4 [
+    error "El vector devaluatorio debe contener cuatro probabilidades."
+  ]
+
+  if intensidad-individual < 0
+    or intensidad-individual > 1 [
+    error "La intensidad devaluatoria debe pertenecer a [0,1]."
+  ]
+
+  if abs (sum vector - 1)
+    > tolerancia-probabilidades [
+    error "El vector previo a la devaluacion no suma uno."
+  ]
+
+  let formal-ajustada item 0 vector
+  let informal-ajustada item 1 vector
+  let desocupacion-ajustada item 2 vector
+  let inactividad-ajustada item 3 vector
+
+  ; Agentes informales:
+  ; menor formalizacion y mayor riesgo de desocupacion.
+
+  if estado-origen-individual = "informal" [
+
+    set formal-ajustada (
+      formal-ajustada
+      * (1 - intensidad-individual)
+    )
+
+    set desocupacion-ajustada (
+      desocupacion-ajustada
+      * (1 + intensidad-individual)
+    )
+  ]
+
+  ; Agentes formales:
+  ; mayores salidas hacia informalidad y desocupacion.
+
+  if estado-origen-individual = "formal" [
+
+    set informal-ajustada (
+      informal-ajustada
+      * (1 + intensidad-individual)
+    )
+
+    set desocupacion-ajustada (
+      desocupacion-ajustada
+      * (1 + intensidad-individual)
+    )
+  ]
+
+  let suma-ajustada (
+    formal-ajustada
+    + informal-ajustada
+    + desocupacion-ajustada
+    + inactividad-ajustada
+  )
+
+  if suma-ajustada <= 0 [
+    error "La devaluacion produjo una suma no positiva."
+  ]
+
+  report (list
+    (formal-ajustada / suma-ajustada)
+    (informal-ajustada / suma-ajustada)
+    (desocupacion-ajustada / suma-ajustada)
+    (inactividad-ajustada / suma-ajustada)
+  )
+
+end
+
+
+; ============================================================
+; APLICAR DEVALUACION AL AGENTE ACTUAL
+; ============================================================
+;
+; Se ejecuta dentro del ask de agentes (informales y formales).
+; Los informales reciben exposicion por cuartil.
+; Los formales reciben la intensidad completa.
+; ============================================================
+
+to aplicar-devaluacion-individual
+
+  if devaluacion-activa?
+    and escenario != "combinado" [
+
+    let intensidad-individual
+      intensidad-devaluacion
+
+    ; Solo los informales reciben exposicion por vulnerabilidad.
+
+    if estado-actual = "informal" [
+
+      let exposicion
+        exposicion-inflacion-cuartil
+          cuartil-actual
+
+      set intensidad-individual (
+        intensidad-devaluacion
+        * exposicion
+      )
+
+      set intensidad-individual
+        min list intensidad-individual 1
+    ]
+
+    ; Inactivos y desocupados no reciben ajustes directos.
+
+    if member? estado-actual [
+      "formal"
+      "informal"
+    ] [
+
+      let ajustadas
+        ajustar-vector-devaluacion
+          (list
+            prob-formal-base
+            prob-informal-base
+            prob-desocupacion-base
+            prob-inactividad-base
+          )
+          estado-actual
+          intensidad-individual
+
+      set prob-formal item 0 ajustadas
+      set prob-informal item 1 ajustadas
+      set prob-desocupacion item 2 ajustadas
+      set prob-inactividad item 3 ajustadas
+    ]
+  ]
+
+end
+
+
+; ============================================================
+; AJUSTAR VECTOR EN EL ESCENARIO COMBINADO
+; ============================================================
+;
+; Todos los ajustes parten de la matriz empirica base.
+; Los multiplicadores se aplican conjuntamente.
+; Luego se normaliza una sola vez.
+; ============================================================
+
+to-report ajustar-vector-combinado [
+  vector
+  estado-origen-individual
+  cuartil-individual
+]
+
+  if length vector != 4 [
+    error "El vector combinado debe tener cuatro probabilidades."
+  ]
+
+  if abs (sum vector - 1)
+    > tolerancia-probabilidades [
+    error "El vector combinado previo no suma uno."
+  ]
+
+  let formal-ajustada
+    item 0 vector
+
+  let informal-ajustada
+    item 1 vector
+
+  let desocupacion-ajustada
+    item 2 vector
+
+  let inactividad-ajustada
+    item 3 vector
+
+
+  ; ----------------------------------------------------------
+  ; Agentes informales
+  ; ----------------------------------------------------------
+
+  if estado-origen-individual = "informal" [
+
+    let exposicion
+      exposicion-inflacion-cuartil
+        cuartil-individual
+
+    let efecto-inflacion
+      min list
+        (intensidad-inflacion * exposicion)
+        1
+
+    let efecto-devaluacion
+      min list
+        (intensidad-devaluacion * exposicion)
+        1
+
+    ; Contratacion facilita informal -> formal.
+    ; Inflacion y devaluacion reducen formalizacion.
+
+    set formal-ajustada (
+      formal-ajustada
+      * (1 + facilidad-contratacion)
+      * (1 - efecto-inflacion)
+      * (1 - efecto-devaluacion)
+    )
+
+    ; Inflacion aumenta permanencia informal.
+
+    set informal-ajustada (
+      informal-ajustada
+      * (1 + efecto-inflacion)
+    )
+
+    ; Devaluacion aumenta informal -> desocupacion.
+
+    set desocupacion-ajustada (
+      desocupacion-ajustada
+      * (1 + efecto-devaluacion)
+    )
+  ]
+
+
+  ; ----------------------------------------------------------
+  ; Agentes formales
+  ; ----------------------------------------------------------
+
+  if estado-origen-individual = "formal" [
+
+    ; Desvinculacion y devaluacion aumentan las salidas.
+
+    set informal-ajustada (
+      informal-ajustada
+      * (1 + facilidad-desvinculacion)
+      * (1 + intensidad-devaluacion)
+    )
+
+    set desocupacion-ajustada (
+      desocupacion-ajustada
+      * (1 + facilidad-desvinculacion)
+      * (1 + intensidad-devaluacion)
+    )
+  ]
+
+
+  ; ----------------------------------------------------------
+  ; Agentes desocupados
+  ; ----------------------------------------------------------
+
+  if estado-origen-individual = "desocupacion" [
+
+    ; Solo actua la facilidad de contratacion.
+
+    set formal-ajustada (
+      formal-ajustada
+      * (1 + facilidad-contratacion)
+    )
+  ]
+
+
+  ; Los inactivos no reciben ajustes directos.
+
+  let suma-ajustada (
+    formal-ajustada
+    + informal-ajustada
+    + desocupacion-ajustada
+    + inactividad-ajustada
+  )
+
+  if suma-ajustada <= 0 [
+    error "El escenario combinado produjo una suma no positiva."
+  ]
+
+  report (
+    list
+      (formal-ajustada / suma-ajustada)
+      (informal-ajustada / suma-ajustada)
+      (desocupacion-ajustada / suma-ajustada)
+      (inactividad-ajustada / suma-ajustada)
+  )
+
+end
+
+
+; ============================================================
+; APLICAR AJUSTE COMBINADO AL AGENTE ACTUAL
+; ============================================================
+;
+; Se ejecuta dentro del ask de agentes (todos los estados).
+; El cuartil solo es relevante para agentes informales.
+; ============================================================
+
+to aplicar-combinado-individual
+
+  if escenario = "combinado"
+    and ticks >= 1
+    and ticks < 4 [
+
+    let cuartil-para-ajuste -1
+
+    if estado-actual = "informal" [
+      set cuartil-para-ajuste
+        cuartil-actual
+    ]
+
+    let ajustadas
+      ajustar-vector-combinado
+        (list
+          prob-formal-base
+          prob-informal-base
+          prob-desocupacion-base
+          prob-inactividad-base
+        )
+        estado-actual
+        cuartil-para-ajuste
+
+    set prob-formal
+      item 0 ajustadas
+
+    set prob-informal
+      item 1 ajustadas
+
+    set prob-desocupacion
+      item 2 ajustadas
+
+    set prob-inactividad
+      item 3 ajustadas
+  ]
+
+end
+
+
+; ============================================================
+; PROBABILIDADES Y SHOCK
+; ============================================================
+
+to preparar-probabilidades
+
+  if count turtles != numero-agentes-inicial [
+    error "Debe ejecutarse setup antes de go."
+  ]
+
+  actualizar-estado-shock
+  actualizar-estado-institucional
+  actualizar-estado-inflacion
+  actualizar-estado-devaluacion
+
+  ask turtles [
+    set estado-origen ""
+    set estado-siguiente ""
+    set cluster-siguiente -1
+    set cuartil-siguiente -1
+    set prob-formal -1
+    set prob-informal -1
+    set prob-desocupacion -1
+    set prob-inactividad -1
+    set prob-formal-base -1
+    set prob-informal-base -1
+    set prob-desocupacion-base -1
+    set prob-inactividad-base -1
+    set fuente-probabilidad ""
+    set nuevo-informal? false
+  ]
+
+  let datos-otros but-first tabla-transiciones-otros-estados
+  ask turtles with [estado-actual != "informal"] [
+    let origen estado-actual
+    let filas filter [ fila -> item 0 fila = origen ] datos-otros
+    if length filas != 1 [ error (word "No existe una unica regla para " origen) ]
+    let regla first filas
+    set prob-formal item 1 regla
+    set prob-informal item 2 regla
+    set prob-desocupacion item 3 regla
+    set prob-inactividad item 4 regla
+    set fuente-probabilidad item 5 regla
+    ; Copia previa al shock.
+    set prob-formal-base
+      prob-formal
+    set prob-informal-base
+      prob-informal
+    set prob-desocupacion-base
+      prob-desocupacion
+    set prob-inactividad-base
+      prob-inactividad
+
+    ifelse escenario = "combinado" [
+      aplicar-combinado-individual
+    ] [
+      aplicar-ajuste-institucional-individual
+      aplicar-devaluacion-individual
+    ]
+  ]
+
+  let datos-informales but-first tabla-transiciones-informales
+  ask turtles with [estado-actual = "informal"] [
+    let clave clave-informal
+    let filas filter [ fila -> (word (item 0 fila) "_" (item 1 fila)) = clave ] datos-informales
+    if length filas != 1 [ error (word "No existe una unica regla para " clave) ]
+    let regla first filas
+    set prob-formal item 2 regla
+    set prob-informal item 3 regla
+    set prob-desocupacion item 4 regla
+    set prob-inactividad item 5 regla
+    set fuente-probabilidad item 6 regla
+    ; Copia previa al shock.
+    set prob-formal-base
+      prob-formal
+    set prob-informal-base
+      prob-informal
+    set prob-desocupacion-base
+      prob-desocupacion
+    set prob-inactividad-base
+      prob-inactividad
+
+    ifelse escenario = "combinado" [
+      aplicar-combinado-individual
+    ] [
+      aplicar-ajuste-institucional-individual
+      aplicar-inflacion-individual
+      aplicar-devaluacion-individual
+    ]
+  ]
+  
+  validar-probabilidades-agentes
+  aplicar-shock-si-corresponde
+  validar-probabilidades-post-shock
+  
+end
+
+to validar-probabilidades-agentes
+  if any? turtles with [prob-formal < 0 or prob-formal > 1 or prob-informal < 0 or prob-informal > 1 or prob-desocupacion < 0 or prob-desocupacion > 1 or prob-inactividad < 0 or prob-inactividad > 1] [
+    error "Existen probabilidades individuales invalidas."
+  ]
+  if any? turtles with [abs (prob-formal + prob-informal + prob-desocupacion + prob-inactividad - 1) > tolerancia-probabilidades] [
+    error "Algun vector individual no suma uno."
+  ]
+  if any? turtles with [fuente-probabilidad = ""] [ error "Existen agentes sin fuente de probabilidad." ]
+
+  let esperado-cluster count turtles with [estado-actual = "informal" and cuartil-actual != -9 and member? cluster-actual [1 2 3 4 5]]
+  let esperado-cuartil count turtles with [estado-actual = "informal" and cuartil-actual != -9 and cluster-actual = -9]
+  let esperado-general count turtles with [estado-actual = "informal" and cuartil-actual = -9]
+  let esperado-otros count turtles with [estado-actual != "informal"]
+
+  if count turtles with [fuente-probabilidad = "cluster_cuartil"] != esperado-cluster [ error "Fuente cluster_cuartil incorrecta." ]
+  if count turtles with [fuente-probabilidad = "cuartil_general"] != esperado-cuartil [ error "Fuente cuartil_general incorrecta." ]
+  if count turtles with [fuente-probabilidad = "general"] != esperado-general [ error "Fuente general incorrecta." ]
+  if count turtles with [fuente-probabilidad = "estado_general"] != esperado-otros [ error "Fuente estado_general incorrecta." ]
+end
+
+
+to actualizar-estado-shock
+  set shock-activo? (escenario = "contractivo" and intensidad-shock > 0 and ticks >= tick-inicio-shock and ticks < tick-fin-shock)
+end
+
+to-report ajustar-vector-shock [vector intensidad]
+  if length vector != 4 [ error "El vector de prueba debe contener cuatro probabilidades." ]
+  if not is-number? intensidad [ error "La intensidad debe ser numerica." ]
+  if intensidad < 0 or intensidad > 1 [ error "La intensidad debe pertenecer a [0,1]." ]
+  if not empty? (filter [ x -> not is-number? x ] vector) [ error "El vector contiene valores no numericos." ]
+  if not empty? (filter [ x -> x < 0 or x > 1 ] vector) [ error "El vector contiene probabilidades fuera de [0,1]." ]
+  if abs (sum vector - 1) > tolerancia-probabilidades [ error "El vector previo al shock no suma uno." ]
+
+  let f (item 0 vector) * (1 - intensidad)
+  let i item 1 vector
+  let d (item 2 vector) * (1 + intensidad)
+  let n item 3 vector
+  let total f + i + d + n
+  if total <= 0 [ error "El shock produjo una suma no positiva." ]
+  report (list (f / total) (i / total) (d / total) (n / total))
+end
+
+to aplicar-shock-si-corresponde
+  if shock-activo? [
+    ask turtles [
+      let ajustadas ajustar-vector-shock (list prob-formal-base prob-informal-base prob-desocupacion-base prob-inactividad-base) intensidad-shock
+      set prob-formal item 0 ajustadas
+      set prob-informal item 1 ajustadas
+      set prob-desocupacion item 2 ajustadas
+      set prob-inactividad item 3 ajustadas
+    ]
+  ]
+end
+
+to validar-probabilidades-post-shock
+  if any? turtles with [prob-formal < 0 or prob-formal > 1 or prob-informal < 0 or prob-informal > 1 or prob-desocupacion < 0 or prob-desocupacion > 1 or prob-inactividad < 0 or prob-inactividad > 1] [
+    error "El shock produjo probabilidades fuera de [0,1]."
+  ]
+  if any? turtles with [abs (prob-formal + prob-informal + prob-desocupacion + prob-inactividad - 1) > tolerancia-probabilidades] [
+    error "Algun vector posterior al shock no suma uno."
+  ]
+
+  if not shock-activo?
+    and not institucional-activo?
+    and not inflacion-activa?
+    and not devaluacion-activa? [
+
+    if any? turtles with [abs (prob-formal - prob-formal-base) > tolerancia-probabilidades or abs (prob-informal - prob-informal-base) > tolerancia-probabilidades or abs (prob-desocupacion - prob-desocupacion-base) > tolerancia-probabilidades or abs (prob-inactividad - prob-inactividad-base) > tolerancia-probabilidades] [
+      error "Sin ningun escenario activo no se recupero exactamente la matriz base."
+    ]
+  ]
+
+  if shock-activo? [
+    if any? turtles with [prob-formal > prob-formal-base + tolerancia-probabilidades] [ error "El shock aumento una probabilidad formal." ]
+    if any? turtles with [prob-desocupacion-base > 0 and prob-desocupacion < prob-desocupacion-base - tolerancia-probabilidades] [ error "El shock redujo una probabilidad positiva de desocupacion." ]
+    if any? turtles with [prob-desocupacion-base = 0 and prob-desocupacion != 0] [ error "El shock creo una transicion ausente." ]
+  ]
+
+  ; ----------------------------------------------------------
+  ; Validaciones institucionales
+  ; ----------------------------------------------------------
+
+  if institucional-activo?
+    and escenario != "combinado" [
+
+    ; Informales y desocupados deben tener una probabilidad
+    ; formal igual o mayor que la probabilidad base.
+
+    if any? turtles with [
+      member? estado-actual [
+        "informal"
+        "desocupacion"
+      ]
+      and prob-formal
+        < prob-formal-base - tolerancia-probabilidades
+    ] [
+      error "La contratación redujo una probabilidad formal."
+    ]
+
+
+    ; Para agentes formales, la desvinculación no puede reducir
+    ; informalidad ni desocupación.
+
+    if any? turtles with [
+      estado-actual = "formal"
+      and prob-informal
+        < prob-informal-base - tolerancia-probabilidades
+    ] [
+      error "La desvinculación redujo una salida hacia informalidad."
+    ]
+
+    if any? turtles with [
+      estado-actual = "formal"
+      and prob-desocupacion
+        < prob-desocupacion-base - tolerancia-probabilidades
+    ] [
+      error "La desvinculación redujo una salida hacia desocupación."
+    ]
+
+
+    ; Los inactivos no reciben ajustes directos.
+
+    if any? turtles with [
+      estado-actual = "inactividad"
+      and (
+        abs (
+          prob-formal
+          - prob-formal-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-informal
+          - prob-informal-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-desocupacion
+          - prob-desocupacion-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-inactividad
+          - prob-inactividad-base
+        ) > tolerancia-probabilidades
+      )
+    ] [
+      error "El escenario institucional modificó directamente a un inactivo."
+    ]
+
+
+    ; No crear transiciones desde cero.
+
+    if any? turtles with [
+      prob-formal-base = 0
+      and prob-formal != 0
+    ] [
+      error "El ajuste institucional creó una entrada formal ausente."
+    ]
+
+    if any? turtles with [
+      prob-informal-base = 0
+      and prob-informal != 0
+    ] [
+      error "El ajuste institucional creó una salida informal ausente."
+    ]
+
+    if any? turtles with [
+      prob-desocupacion-base = 0
+      and prob-desocupacion != 0
+    ] [
+      error "El ajuste institucional creó una salida desocupada ausente."
+    ]
+  ]
+
+  ; ----------------------------------------------------------
+  ; Validaciones del escenario inflacionario
+  ; ----------------------------------------------------------
+
+  if inflacion-activa?
+    and escenario != "combinado" [
+
+    if not member? escenario [
+      "inflacion"
+      "combinado"
+    ] [
+      error "La inflacion esta activa fuera de su escenario."
+    ]
+
+    ; Solo los informales deben recibir cambios directos.
+
+    if any? turtles with [
+      estado-actual != "informal"
+      and (
+        abs (
+          prob-formal
+          - prob-formal-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-informal
+          - prob-informal-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-desocupacion
+          - prob-desocupacion-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-inactividad
+          - prob-inactividad-base
+        ) > tolerancia-probabilidades
+      )
+    ] [
+      error "La inflacion modifico directamente a un no informal."
+    ]
+
+    ; Entre informales, formalidad no puede aumentar.
+
+    if any? turtles with [
+      estado-actual = "informal"
+      and prob-formal
+        > prob-formal-base
+        + tolerancia-probabilidades
+    ] [
+      error "La inflacion aumento una probabilidad formal."
+    ]
+
+    ; La permanencia informal no puede disminuir.
+
+    if any? turtles with [
+      estado-actual = "informal"
+      and prob-informal
+        < prob-informal-base
+        - tolerancia-probabilidades
+    ] [
+      error "La inflacion redujo la permanencia informal."
+    ]
+
+    ; No crear probabilidades desde cero.
+
+    if any? turtles with [
+      estado-actual = "informal"
+      and prob-formal-base = 0
+      and prob-formal != 0
+    ] [
+      error "La inflacion creo una formalizacion ausente."
+    ]
+
+    if any? turtles with [
+      estado-actual = "informal"
+      and prob-informal-base = 0
+      and prob-informal != 0
+    ] [
+      error "La inflacion creo una permanencia informal ausente."
+    ]
+  ]
+
+  ; ----------------------------------------------------------
+  ; Validaciones del escenario devaluatorio
+  ; ----------------------------------------------------------
+
+  if devaluacion-activa?
+    and escenario != "combinado" [
+
+    if not member? escenario [
+      "devaluacion"
+      "combinado"
+    ] [
+      error "La devaluacion esta activa fuera de su escenario."
+    ]
+
+    ; Los inactivos no deben cambiar.
+
+    if any? turtles with [
+      estado-actual = "inactividad"
+      and (
+        abs (
+          prob-formal
+          - prob-formal-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-informal
+          - prob-informal-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-desocupacion
+          - prob-desocupacion-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-inactividad
+          - prob-inactividad-base
+        ) > tolerancia-probabilidades
+      )
+    ] [
+      error "La devaluacion modifico a un inactivo."
+    ]
+
+    ; Los desocupados no deben recibir cambios directos.
+
+    if any? turtles with [
+      estado-actual = "desocupacion"
+      and (
+        abs (
+          prob-formal
+          - prob-formal-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-informal
+          - prob-informal-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-desocupacion
+          - prob-desocupacion-base
+        ) > tolerancia-probabilidades
+        or abs (
+          prob-inactividad
+          - prob-inactividad-base
+        ) > tolerancia-probabilidades
+      )
+    ] [
+      error "La devaluacion modifico a un desocupado."
+    ]
+
+    ; No crear transiciones desde cero.
+
+    if any? turtles with [
+      prob-formal-base = 0
+      and prob-formal != 0
+    ] [
+      error "La devaluacion creo una entrada formal ausente."
+    ]
+
+    if any? turtles with [
+      prob-informal-base = 0
+      and prob-informal != 0
+    ] [
+      error "La devaluacion creo una salida informal ausente."
+    ]
+
+    if any? turtles with [
+      prob-desocupacion-base = 0
+      and prob-desocupacion != 0
+    ] [
+      error "La devaluacion creo una salida desocupada ausente."
+    ]
+  ]
+
+  ; ----------------------------------------------------------
+  ; Validaciones del escenario combinado
+  ; ----------------------------------------------------------
+
+  if escenario = "combinado"
+    and ticks >= 1
+    and ticks < 4 [
+
+    if any? turtles with [
+      prob-formal < 0 or prob-formal > 1 or
+      prob-informal < 0 or prob-informal > 1 or
+      prob-desocupacion < 0 or prob-desocupacion > 1 or
+      prob-inactividad < 0 or prob-inactividad > 1
+    ] [
+      error "El escenario combinado produjo probabilidades fuera de [0,1]."
+    ]
+
+    if any? turtles with [
+      abs (prob-formal + prob-informal + prob-desocupacion + prob-inactividad - 1)
+      > tolerancia-probabilidades
+    ] [
+      error "El escenario combinado produjo un vector que no suma uno."
+    ]
+
+    if any? turtles with [
+      prob-formal-base = 0
+      and prob-formal != 0
+    ] [
+      error "El escenario combinado creo una entrada formal ausente."
+    ]
+
+    if any? turtles with [
+      prob-informal-base = 0
+      and prob-informal != 0
+    ] [
+      error "El escenario combinado creo una salida informal ausente."
+    ]
+
+    if any? turtles with [
+      prob-desocupacion-base = 0
+      and prob-desocupacion != 0
+    ] [
+      error "El escenario combinado creo una salida desocupada ausente."
+    ]
+  ]
+
+end
+
+; ============================================================
+; SORTEOS Y ACTUALIZACION
+; ============================================================
+
+to sortear-destinos-provisionales
+  if any? turtles with [fuente-probabilidad = ""] [ error "Deben prepararse primero las probabilidades." ]
+  ask turtles [
+    set estado-origen estado-actual
+    let u random-float 1
+    set estado-siguiente "inactividad"
+    if u < prob-formal [ set estado-siguiente "formal" ]
+    if u >= prob-formal and u < prob-formal + prob-informal [ set estado-siguiente "informal" ]
+    if u >= prob-formal + prob-informal and u < prob-formal + prob-informal + prob-desocupacion [ set estado-siguiente "desocupacion" ]
+  ]
+  if any? turtles with [not member? estado-siguiente ["formal" "informal" "desocupacion" "inactividad"]] [ error "Existe un destino provisional invalido." ]
+end
+
+to sortear-perfiles-nuevos-informales
+  if any? turtles with [estado-origen = "" or estado-siguiente = ""] [ error "Debe sortearse primero el destino." ]
+  let datos but-first tabla-perfiles-entrada-por-origen
+  ask turtles with [estado-origen != "informal" and estado-siguiente = "informal"] [
+    let origen estado-origen
+    let filas filter [ fila -> item 0 fila = origen ] datos
+    if empty? filas [ error (word "No hay perfiles para el origen " origen) ]
+    let suma sum map [ fila -> item 3 fila ] filas
+    let u random-float suma
+    let acumulada 0
+    let elegida []
+    foreach filas [ fila ->
+      if empty? elegida [
+        set acumulada acumulada + item 3 fila
+        if u < acumulada [ set elegida fila ]
+      ]
+    ]
+    if empty? elegida [ error (word "No pudo sortearse el perfil del agente " id-agente) ]
+    let c item 1 elegida
+    let q item 2 elegida
+    ifelse c = "sin_cluster" [ set cluster-siguiente -9 ] [
+      ifelse is-number? c [ set cluster-siguiente c ] [ set cluster-siguiente read-from-string c ]
+    ]
+    ifelse is-number? q [ set cuartil-siguiente q ] [ set cuartil-siguiente read-from-string q ]
+  ]
+
+  let nuevos turtles with [estado-origen != "informal" and estado-siguiente = "informal"]
+  if any? nuevos with [not member? cluster-siguiente [-9 1 2 3 4 5]] [ error "Nuevo informal con cluster invalido." ]
+  if any? nuevos with [not member? cuartil-siguiente [1 2 3 4]] [ error "Nuevo informal con cuartil invalido." ]
+end
+
+to actualizar-estados-simultaneamente
+  if any? turtles with [estado-origen = "" or estado-siguiente = ""] [ error "Falta sortear los destinos." ]
+
+  let tick-esperado ticks + 1
+  let destino-formal count turtles with [estado-siguiente = "formal"]
+  let destino-informal count turtles with [estado-siguiente = "informal"]
+  let destino-desocupacion count turtles with [estado-siguiente = "desocupacion"]
+  let destino-inactividad count turtles with [estado-siguiente = "inactividad"]
+  let entradas-informal count turtles with [estado-origen != "informal" and estado-siguiente = "informal"]
+  let shock-aplicado-en-transicion? shock-activo?
+
+  ask turtles [
+    set nuevo-informal? (estado-origen != "informal" and estado-siguiente = "informal")
+
+    if estado-origen = "informal" and estado-siguiente != "informal" [
+      set ultimo-cluster-informal cluster-actual
+      set ultimo-cuartil-informal cuartil-actual
+      set cluster-actual -1
+      set cuartil-actual -1
+      set ivlr-observado -1
+    ]
+
+    if nuevo-informal? [
+      set cluster-actual cluster-siguiente
+      set cuartil-actual cuartil-siguiente
+      set ivlr-observado -9
+      set ultimo-cluster-informal cluster-actual
+      set ultimo-cuartil-informal cuartil-actual
+    ]
+
+    set estado-actual estado-siguiente
+    set cluster-siguiente -1
+    set cuartil-siguiente -1
+    set prob-formal -1
+    set prob-informal -1
+    set prob-desocupacion -1
+    set prob-inactividad -1
+    set prob-formal-base -1
+    set prob-informal-base -1
+    set prob-desocupacion-base -1
+    set prob-inactividad-base -1
+    set fuente-probabilidad ""
+  ]
+
+  tick
+  registrar-indicadores
+  validar-indicadores
+  validar-actualizacion-simultanea destino-formal destino-informal destino-desocupacion destino-inactividad entradas-informal tick-esperado shock-aplicado-en-transicion?
+end
+
+to validar-actualizacion-simultanea [destino-formal destino-informal destino-desocupacion destino-inactividad entradas-informal tick-esperado shock-aplicado?]
+  if n-formales != destino-formal [ error "El total formal no coincide con el destino." ]
+  if n-informales != destino-informal [ error "El total informal no coincide con el destino." ]
+  if n-desocupados != destino-desocupacion [ error "El total desocupado no coincide con el destino." ]
+  if n-inactivos != destino-inactividad [ error "El total inactivo no coincide con el destino." ]
+  if count turtles with [nuevo-informal?] != entradas-informal [ error "El numero de nuevos informales no coincide." ]
+  if any? turtles with [estado-actual = "informal" and not member? cluster-actual [-9 1 2 3 4 5]] [ error "Existe un informal con cluster invalido." ]
+  if any? turtles with [estado-actual = "informal" and not member? cuartil-actual [-9 1 2 3 4]] [ error "Existe un informal con cuartil invalido." ]
+  if any? turtles with [estado-actual != "informal" and (cluster-actual != -1 or cuartil-actual != -1 or ivlr-observado != -1)] [ error "Existe un no informal con perfil activo." ]
+  if count turtles != numero-agentes-inicial [ error "Cambio el numero de agentes." ]
+  if abs (sum [peso] of turtles - peso-total-inicial) > 1.0e-6 [ error "Cambio el peso total." ]
+  if ticks != tick-esperado [ error (word "Se esperaba el tick " tick-esperado " y se obtuvo " ticks) ]
+
+  print "============================================"
+  print (word "TICK " ticks " COMPLETADO")
+  print (word "Escenario: " escenario)
+  print (word "Shock aplicado en esta transicion: " shock-aplicado?)
+  print (word "Institucional activo: " institucional-activo?)
+  print (word "Inflacion activa: " inflacion-activa?)
+  print (word "Devaluacion activa: " devaluacion-activa?)
+  print (word "Formal: " n-formales)
+  print (word "Informal: " n-informales)
+  print (word "Desocupacion: " n-desocupados)
+  print (word "Inactividad: " n-inactivos)
+  print (word "Nuevos informales: " entradas-informal)
+  print (word "Peso total: " sum [peso] of turtles)
+  print (word "Proporcion ponderada formal: " precision proporcion-formales 6)
+  print (word "Proporcion ponderada informal: " precision proporcion-informales 6)
+  print (word "Proporcion ponderada desocupada: " precision proporcion-desocupados 6)
+  print (word "Proporcion ponderada inactiva: " precision proporcion-inactivos 6)
+  print "============================================"
+end
+
+; ============================================================
+; AUDITORIA MANUAL
+; ============================================================
+
+to auditar-transiciones-provisionales
+  if any? turtles with [estado-origen = "" or estado-siguiente = ""] [ error "No existen transiciones provisionales para auditar." ]
+  let total count turtles
+  let peso-total sum [peso] of turtles
+  let permanencia-informal count turtles with [estado-origen = "informal" and estado-siguiente = "informal"]
+  let salidas-informal count turtles with [estado-origen = "informal" and estado-siguiente != "informal"]
+  let entradas-informal count turtles with [estado-origen != "informal" and estado-siguiente = "informal"]
+  if total != numero-agentes-inicial [ error "La auditoria no cubre a todos los agentes." ]
+  if abs (peso-total - peso-total-inicial) > 1.0e-6 [ error "La auditoria no conserva el peso." ]
+
+  print "============================================"
+  print "AUDITORIA PROVISIONAL"
+  print (word "Shock activo: " shock-activo?)
+  print (word "Institucional activo: " institucional-activo?)
+  print (word "Inflacion activa: " inflacion-activa?)
+  print (word "Devaluacion activa: " devaluacion-activa?)
+  print (word "Permanencia informal: " permanencia-informal)
+  print (word "Salidas de informalidad: " salidas-informal)
+  print (word "Entradas a informalidad: " entradas-informal)
+  print (word "Total: " total)
+  print (word "Peso: " peso-total)
+  print (word "Tick previo a actualizacion: " ticks)
+  print "============================================"
+end
+
+
+; ============================================================
+; AVANZAR DESDE LA INTERFAZ
+; ============================================================
+
+to avanzar-desde-interfaz
+
+  if count turtles = 0 [
+    user-message "Primero debe ejecutar Inicializar."
+    stop
+  ]
+
+  if ticks >= 8 [
+    stop
+  ]
+
+  go
+
+end
+
+; ============================================================
+; REINICIAR DESDE LA INTERFAZ
+; ============================================================
+
+to reiniciar-desde-interfaz
+
+  setup-desde-interfaz
+
+end]]></code>
+  <widgets>
+    <view x="1238" wrappingAllowedX="true" y="5" frameRate="30.0" minPycor="-8" height="16" showTickCounter="true" patchSize="0.71" fontSize="6" wrappingAllowedY="true" width="16" tickCounterLabel="ticks" maxPycor="8" updateMode="0" maxPxcor="8" minPxcor="-8"></view>
+    <plot x="450" autoPlotX="true" yMax="100.0" autoPlotY="false" yAxis="Porcentaje" y="5" xMin="0.0" height="370" legend="true" xMax="8.0" yMin="0.0" xAxis="Tick" display="Evolucion de estados laborales" width="650" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Formalidad" color="-13210332" legend="true">
+        <setup></setup>
+        <update>plot (100 * proporcion-formales)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Informalidad" color="-3844592" legend="true">
+        <setup></setup>
+        <update>plot (100 * proporcion-informales)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Desocupacion" color="-7858858" legend="true">
+        <setup></setup>
+        <update>plot (100 * proporcion-desocupados)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Inactividad" color="-14070903" legend="true">
+        <setup></setup>
+        <update>plot (100 * proporcion-inactivos)</update>
+      </pen>
+    </plot>
+    <monitor x="1105" precision="2" y="300" height="75" fontSize="11" width="115" display="Inactividad %">100 * proporcion-inactivos</monitor>
+    <monitor x="1105" precision="2" y="210" height="75" fontSize="11" width="115" display="Desocupacion %">100 * proporcion-desocupados</monitor>
+    <monitor x="1105" precision="2" y="120" height="75" fontSize="11" width="115" display="Informalidad %">100 * proporcion-informales</monitor>
+    <monitor x="1105" precision="2" y="30" height="75" fontSize="11" width="115" display="Formalidad %">100 * proporcion-formales</monitor>
+    <chooser x="20" y="15" height="60" variable="escenario-interfaz" current="3" width="155" display="escenario-interfaz">
+      <choice type="string" value="Base"></choice>
+      <choice type="string" value="Institucional: contratacion"></choice>
+      <choice type="string" value="Institucional: flexibilidad moderada"></choice>
+      <choice type="string" value="Institucional: flexibilidad intensa"></choice>
+      <choice type="string" value="Inflacion baja"></choice>
+      <choice type="string" value="Inflacion moderada"></choice>
+      <choice type="string" value="Inflacion alta"></choice>
+      <choice type="string" value="Devaluacion baja"></choice>
+      <choice type="string" value="Devaluacion moderada"></choice>
+      <choice type="string" value="Devaluacion alta"></choice>
+      <choice type="string" value="Combinado moderado"></choice>
+    </chooser>
+    <input x="180" multiline="false" y="15" height="60" variable="semilla-interfaz" type="number" width="150">42.0</input>
+    <button x="25" y="85" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="65" display="Inicializar">setup-desde-interfaz</button>
+    <button x="100" y="85" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="85" display="Avanzar 1 tick">avanzar-desde-interfaz</button>
+    <button x="195" y="85" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="80" display="Ejecutar">avanzar-desde-interfaz</button>
+    <button x="285" y="85" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="65" display="Reiniciar">reiniciar-desde-interfaz</button>
+    <monitor x="25" precision="0" y="140" height="60" fontSize="11" width="100" display="Tick">ticks</monitor>
+    <monitor x="130" precision="0" y="140" height="60" fontSize="11" width="100" display="Escenario">escenario</monitor>
+    <monitor x="240" precision="0" y="140" height="60" fontSize="11" width="100" display="Semilla">semilla-modelo</monitor>
+    <monitor x="345" precision="0" y="140" height="60" fontSize="11" width="100" display="Peso total">sum [peso] of turtles</monitor>
+    <monitor x="25" precision="0" y="225" height="60" fontSize="11" width="100" display="Agentes">count turtles</monitor>
+    <monitor x="130" precision="2" y="225" height="60" fontSize="11" width="100" display="Devaluacion">intensidad-devaluacion</monitor>
+    <monitor x="235" precision="2" y="225" height="60" fontSize="11" width="100" display="Inflacion">intensidad-inflacion</monitor>
+    <monitor x="345" precision="0" y="310" height="60" fontSize="11" width="100" display="Inflacion activa">inflacion-activa?</monitor>
+    <monitor x="240" precision="0" y="310" height="60" fontSize="11" width="100" display="Devaluacion activa">devaluacion-activa?</monitor>
+    <monitor x="135" precision="0" y="310" height="60" fontSize="11" width="100" display="Institucional activo">institucional-activo?</monitor>
+    <monitor x="30" precision="2" y="310" height="60" fontSize="11" width="100" display="Contratacion">facilidad-contratacion</monitor>
+    <monitor x="345" precision="2" y="225" height="60" fontSize="11" width="100" display="Desvinculacion">facilidad-desvinculacion</monitor>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="piloto_base_1_tick" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup-con-semilla behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 1]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>ticks</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="base_1_tick_100_replicas" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup-con-semilla behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 1]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>ticks</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="base_8_ticks_100_replicas" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>ifelse intensidad-shock = 0
+[
+  setup-con-semilla behaviorspace-run-number
+]
+[
+  setup-shock behaviorspace-run-number intensidad-shock
+]</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-shock</metric>
+        <metric>ticks</metric>
+        <metric>shock-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+      </metrics>
+      <constants>
+        <steppedValueSet variable="intensidad-shock" first="0" step="0.15" last="0.45"></steppedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="base_40_ticks_100_replicas" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup-con-semilla behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 40]]></exitCondition>
+      <runMetricsCondition>ticks mod 4 = 0</runMetricsCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>ticks</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+      </metrics>
+    </experiment>
+    <experiment name="institucional_I0_base_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-con-semilla behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="institucional_I1_contratacion_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-institucional
+  behaviorspace-run-number
+  0.15
+  0</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="institucional_I2_flexibilidad_moderada_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-institucional
+  behaviorspace-run-number
+  0.15
+  0.15</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="institucional_I3_flexibilidad_intensa_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-institucional
+  behaviorspace-run-number
+  0.30
+  0.30</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="institucional_I0_base_8_ticks (copy)" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-con-semilla behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 1]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 2]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 3]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 4]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 5]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="institucional_I1_contratacion_8_ticks (copy)" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-institucional
+  behaviorspace-run-number
+  0.15
+  0</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 1]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 2]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 3]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 4]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 5]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="institucional_I2_flexibilidad_moderada_8_ticks (copy)" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-institucional
+  behaviorspace-run-number
+  0.15
+  0.15</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 1]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 2]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 3]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 4]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 5]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="institucional_I3_flexibilidad_intensa_8_ticks (copy)" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-institucional
+  behaviorspace-run-number
+  0.30
+  0.30</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [nuevo-informal?]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 1]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 2]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 3]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 4]</metric>
+        <metric>count turtles with [estado-actual = "informal" and cluster-actual = 5]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="inflacion_M0_base_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-con-semilla behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-inflacion</metric>
+        <metric>ticks</metric>
+        <metric>inflacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="inflacion_M1_baja_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-inflacion behaviorspace-run-number 0.158</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-inflacion</metric>
+        <metric>ticks</metric>
+        <metric>inflacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="inflacion_M2_moderada_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-inflacion behaviorspace-run-number 0.325</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-inflacion</metric>
+        <metric>ticks</metric>
+        <metric>inflacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="inflacion_M3_alta_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-inflacion behaviorspace-run-number 0.421</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-inflacion</metric>
+        <metric>ticks</metric>
+        <metric>inflacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal" and cuartil-actual = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="devaluacion_D0_base_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-con-semilla behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-devaluacion</metric>
+        <metric>ticks</metric>
+        <metric>devaluacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="devaluacion_D1_baja_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-devaluacion behaviorspace-run-number 0.057</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-devaluacion</metric>
+        <metric>ticks</metric>
+        <metric>devaluacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="devaluacion_D2_moderada_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-devaluacion behaviorspace-run-number 0.112</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-devaluacion</metric>
+        <metric>ticks</metric>
+        <metric>devaluacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="devaluacion_D3_alta_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-devaluacion behaviorspace-run-number 0.186</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-devaluacion</metric>
+        <metric>ticks</metric>
+        <metric>devaluacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion" and ultimo-cuartil-informal = 4]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 1]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 2]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 3]</metric>
+        <metric>count turtles with [estado-origen = "informal" and ultimo-cuartil-informal = 4]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="combinado_C0_base_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-con-semilla behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-inflacion</metric>
+        <metric>intensidad-devaluacion</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>inflacion-activa?</metric>
+        <metric>devaluacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+      </metrics>
+    </experiment>
+    <experiment name="combinado_C1_moderado_8_ticks" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup-combinado-moderado behaviorspace-run-number</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 8]]></exitCondition>
+      <metrics>
+        <metric>semilla-modelo</metric>
+        <metric>escenario</metric>
+        <metric>intensidad-inflacion</metric>
+        <metric>intensidad-devaluacion</metric>
+        <metric>facilidad-contratacion</metric>
+        <metric>facilidad-desvinculacion</metric>
+        <metric>ticks</metric>
+        <metric>institucional-activo?</metric>
+        <metric>inflacion-activa?</metric>
+        <metric>devaluacion-activa?</metric>
+        <metric>count turtles</metric>
+        <metric>sum [peso] of turtles</metric>
+        <metric>n-formales</metric>
+        <metric>n-informales</metric>
+        <metric>n-desocupados</metric>
+        <metric>n-inactivos</metric>
+        <metric>proporcion-formales</metric>
+        <metric>proporcion-informales</metric>
+        <metric>proporcion-desocupados</metric>
+        <metric>proporcion-inactivos</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "formal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "informal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal" and estado-actual = "desocupacion"]</metric>
+        <metric>count turtles with [estado-origen = "informal"]</metric>
+        <metric>count turtles with [estado-origen = "formal"]</metric>
+      </metrics>
+    </experiment>
+  </experiments>
+</model>
